@@ -1,32 +1,73 @@
 #include "DHT.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
 
-// --- ตั้งค่า Pin อุปกรณ์ ---
+// --- WiFi & MQTT Config ---
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* mqtt_server = "broker.hivemq.com"; // หรือ IP ของเครื่องคุณ
+const char* mqtt_topic = "sensor/storage/data";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// --- Pin Setup ---
 #define DHTPIN 4
 #define DHTTYPE DHT22
 #define DOOR_SENSOR_PIN 27
 const int trigPin = 5;
 const int echoPin = 18;
 
-// --- ตั้งค่าเซนเซอร์ ---
 DHT dht(DHTPIN, DHTTYPE);
 
-// --- Moving Average Filter Setup ---
+// --- Filter & Variables ---
 const int numReadings = 10;
 float readingsHI[numReadings], readingsStock[numReadings], readingsDew[numReadings];
 int readIndex = 0;
 float totalHI = 0, totalStock = 0, totalDew = 0;
 
-// --- ตัวแปรสำหรับจับเวลา (Timing) ---
 unsigned long doorOpenStartTime = 0;
 unsigned long lastOpenDuration = 0;
 bool isDoorOpen = false;
 
-// --- ค่ามาตรฐานชั้นวาง (Calibration) ---
-const float emptyDist = 100.0; // ระยะพื้น (ปรับตามที่คุณวัดได้)
-const float fullDist = 10.0;   // ระยะของเต็ม (ปรับตามที่คุณวัดได้)
+const float emptyDist = 100.0;
+const float fullDist = 10.0;
+
+// ฟังก์ชันเชื่อมต่อ WiFi
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+}
+
+// ฟังก์ชันเชื่อมต่อ MQTT (Reconnect อัตโนมัติ)
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  
   dht.begin();
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
@@ -35,22 +76,26 @@ void setup() {
   for (int i = 0; i < numReadings; i++) {
     readingsHI[i] = 0; readingsStock[i] = 0; readingsDew[i] = 0;
   }
-  Serial.println(">>> System Fully Integrated: Monitoring & Timing <<<");
 }
 
 void loop() {
-  // --- 1. การจับเวลาประตู (Magnetic Sensor Logic) ---
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  // --- 1. Door Logic ---
   int doorState = digitalRead(DOOR_SENSOR_PIN);
-  if (doorState == HIGH && !isDoorOpen) { // จังหวะประตูถูกเปิด
+  if (doorState == HIGH && !isDoorOpen) { 
     doorOpenStartTime = millis();
     isDoorOpen = true;
   }
-  if (doorState == LOW && isDoorOpen) { // จังหวะประตูเพิ่งปิด
+  if (doorState == LOW && isDoorOpen) { 
     lastOpenDuration = (millis() - doorOpenStartTime) / 1000;
     isDoorOpen = false;
   }
 
-  // --- 2. อ่านค่า Raw Data จากเซนเซอร์ ---
+  // --- 2. Sensor Readings ---
   digitalWrite(trigPin, LOW); delayMicroseconds(2);
   digitalWrite(trigPin, HIGH); delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
@@ -61,13 +106,13 @@ void loop() {
   float t = dht.readTemperature();
   if (isnan(h) || isnan(t)) return;
 
-  // --- 3. คำนวณ Analytics (Heat Index & Dew Point) ---
+  // --- 3. Analytics ---
   float rawHI = dht.computeHeatIndex(t, h, false);
   float a = 17.27, b = 237.7;
   float alpha = ((a * t) / (b + t)) + log(h / 100.0);
   float rawDewPoint = (b * alpha) / (a - alpha);
 
-  // --- 4. กรองข้อมูล (Moving Average Filter) ---
+  // --- 4. Moving Average Filter ---
   totalStock -= readingsStock[readIndex];
   totalHI -= readingsHI[readIndex];
   totalDew -= readingsDew[readIndex];
@@ -86,14 +131,20 @@ void loop() {
   float avgHI = totalHI / numReadings;
   float avgDewPoint = totalDew / numReadings;
 
-  // --- 5. ส่งข้อมูลออก Serial (Format สำหรับส่งต่อ SQL) ---
-  Serial.print("STOCK:");  Serial.print(avgStock, 1);
-  Serial.print("|HI:");     Serial.print(avgHI, 1);
-  Serial.print("|DEW:");    Serial.print(avgDewPoint, 1);
-  Serial.print("|DOOR:");   Serial.print(doorState == LOW ? "CLOSED" : "OPEN");
-  Serial.print("|TIME:");   Serial.print(lastOpenDuration); // วินาทีที่เปิดล่าสุด
-  Serial.print("|TEMP:");   Serial.print(t, 1);
-  Serial.print("|HUM:");    Serial.println(h, 1);
+  // --- 5. Publish to MQTT (JSON Format) ---
+  // สร้าง String ในรูปแบบ JSON เพื่อให้ฝั่ง Server/SQL นำไป parse ง่ายๆ
+  String payload = "{";
+  payload += "\"stock\":" + String(avgStock, 1) + ",";
+  payload += "\"heat_index\":" + String(avgHI, 1) + ",";
+  payload += "\"dew_point\":" + String(avgDewPoint, 1) + ",";
+  payload += "\"door\":\"" + String(doorState == LOW ? "CLOSED" : "OPEN") + "\",";
+  payload += "\"last_open_sec\":" + String(lastOpenDuration) + ",";
+  payload += "\"temp\":" + String(t, 1) + ",";
+  payload += "\"hum\":" + String(h, 1);
+  payload += "}";
 
-  delay(1000); // อัปเดตข้อมูลทุก 1 วินาที
+  Serial.println("Publishing: " + payload);
+  client.publish(mqtt_topic, payload.c_str());
+
+  delay(2000); // MQTT ไม่ควรส่งถี่เกินไป (แนะนำ 2 วินาทีขึ้นไป)
 }
